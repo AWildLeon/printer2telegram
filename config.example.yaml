@@ -1,0 +1,27 @@
+# Copy to config.yaml and fill in. Keep config.yaml out of git!
+
+imap:
+  host: imap.example.com
+  user: printer@example.com
+  password: "app-password-here"
+  # port: 993  # optional, this is the default
+
+smtp:
+  host: smtp.example.com
+  user: printer@example.com
+  password: "app-password-here"
+  # port: 465  # optional, this is the default
+
+# CUPS printer name (see: lpstat -p)
+printer: MyPrinter
+
+# scans get mailed to this address
+scan_to: you@example.com
+
+# only mail from these addresses is acted on
+# (both print and scan requests)
+allowed_emails:
+  - you@example.com
+
+# SANE device name (optional; see: scanimage -L)
+# scanner: "pixma:04A9176D_XXXX"

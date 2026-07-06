@@ -1,0 +1,8 @@
+# real credentials live here -- never commit
+config.yaml
+
+# nix build output
+result
+result-*
+
+__pycache__/
