@@ -500,9 +500,14 @@ def handle_callback(bot, cb, config, state):
     except Exception:
         traceback.print_exc()
     finally:
-        # always stop the button's loading spinner
-        bot.call("answerCallbackQuery",
-                 callback_query_id=cb["id"], text=answer)
+        # always stop the button's loading spinner; this fails
+        # ("query is too old") for buttons that were pressed
+        # while we were offline, which is fine
+        try:
+            bot.call("answerCallbackQuery",
+                     callback_query_id=cb["id"], text=answer)
+        except RuntimeError as e:
+            print(f"cannot answer callback: {e}")
 
 
 # wait this long between attempts while the device is busy
@@ -601,13 +606,18 @@ def run(config):
             print(f"connected as @{me['username']}, polling")
             while True:
                 for update in bot.poll():
-                    msg = update.get("message")
-                    if msg is not None:
-                        handle_message(bot, jobs, msg, config,
-                                       state, pending)
-                    cb = update.get("callback_query")
-                    if cb is not None:
-                        handle_callback(bot, cb, config, state)
+                    # one broken update must not kill the daemon
+                    # (e.g. replying to a user who blocked the bot)
+                    try:
+                        msg = update.get("message")
+                        if msg is not None:
+                            handle_message(bot, jobs, msg, config,
+                                           state, pending)
+                        cb = update.get("callback_query")
+                        if cb is not None:
+                            handle_callback(bot, cb, config, state)
+                    except Exception:
+                        traceback.print_exc()
         except (OSError, requests.RequestException) as e:
             print(f"connection lost: {e}, reconnecting in 30s")
             time.sleep(30)
