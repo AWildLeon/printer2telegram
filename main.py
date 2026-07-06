@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import re
+import signal
 import sys
 import tempfile
 import threading
@@ -531,12 +532,23 @@ def handle_callback(bot, cb, config, state):
 # wait this long between attempts while the device is busy
 RETRY_DELAYS = [15, 30, 60, 120, 300]
 
+SHUTDOWN_TEXT = ("Der Bot fährt gerade herunter – bitte schick "
+                 "deinen Auftrag später noch einmal.")
+
+
+class Shutdown(BaseException):
+    """Raised in the main thread by SIGTERM/SIGINT.
+
+    BaseException so the catch-all handlers around updates and
+    jobs cannot swallow it.
+    """
+
 
 def is_busy_error(e):
     return "busy" in str(e).lower()
 
 
-def run_job(bot, chat, job):
+def run_job(bot, chat, job, stop):
     """Run one queued job, waiting out a busy device with backoff."""
     for i in range(len(RETRY_DELAYS) + 1):
         try:
@@ -552,15 +564,20 @@ def run_job(bot, chat, job):
                                     "beschäftigt – ich versuche es "
                                     "automatisch weiter.")
             print(f"device busy, retrying in {RETRY_DELAYS[i]}s")
-            time.sleep(RETRY_DELAYS[i])
+            if stop.wait(RETRY_DELAYS[i]):
+                bot.send_text(chat, SHUTDOWN_TEXT)
+                return
 
 
-def worker(bot, jobs):
+def worker(bot, jobs, stop):
     """Process print/scan jobs one after the other, forever."""
     while True:
         chat, job = jobs.get()
         try:
-            run_job(bot, chat, job)
+            if stop.is_set():
+                bot.send_text(chat, SHUTDOWN_TEXT)
+            else:
+                run_job(bot, chat, job, stop)
         except Exception:
             # e.g. telegram unreachable while reporting a failure
             traceback.print_exc()
@@ -614,31 +631,59 @@ def run(config):
     state = State(config.state_file)
     jobs = queue.Queue()
     pending = set()
-    threading.Thread(target=worker, args=(bot, jobs),
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        raise Shutdown(signal.Signals(signum).name)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    threading.Thread(target=worker, args=(bot, jobs, stop),
                      daemon=True).start()
-    while True:
-        try:
-            me = bot.call("getMe")
-            bot.call("setMyCommands",
-                     commands=json.dumps(BOT_COMMANDS))
-            print(f"connected as @{me['username']}, polling")
-            while True:
-                for update in bot.poll():
-                    # one broken update must not kill the daemon
-                    # (e.g. replying to a user who blocked the bot)
-                    try:
-                        msg = update.get("message")
-                        if msg is not None:
-                            handle_message(bot, jobs, msg, config,
-                                           state, pending)
-                        cb = update.get("callback_query")
-                        if cb is not None:
-                            handle_callback(bot, cb, config, state)
-                    except Exception:
-                        traceback.print_exc()
-        except (OSError, requests.RequestException) as e:
-            print(f"connection lost: {e}, reconnecting in 30s")
-            time.sleep(30)
+    try:
+        while True:
+            try:
+                me = bot.call("getMe")
+                bot.call("setMyCommands",
+                         commands=json.dumps(BOT_COMMANDS))
+                print(f"connected as @{me['username']}, polling")
+                while True:
+                    for update in bot.poll():
+                        # one broken update must not kill the daemon
+                        # (e.g. a user who blocked the bot)
+                        try:
+                            msg = update.get("message")
+                            if msg is not None:
+                                handle_message(bot, jobs, msg,
+                                               config, state,
+                                               pending)
+                            cb = update.get("callback_query")
+                            if cb is not None:
+                                handle_callback(bot, cb, config,
+                                                state)
+                        except Exception:
+                            traceback.print_exc()
+            except (OSError, requests.RequestException) as e:
+                print(f"connection lost: {e}, reconnecting in 30s")
+                time.sleep(30)
+    except Shutdown as e:
+        # a second signal now kills us the hard way
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print(f"got {e}, shutting down")
+        stop.set()
+        if jobs.unfinished_tasks:
+            print(f"waiting for {jobs.unfinished_tasks} job(s)")
+            jobs.join()
+        if bot.offset is not None:
+            # confirm the processed updates so telegram does not
+            # replay them (= reprint jobs) to the next daemon
+            try:
+                bot.call("getUpdates", offset=bot.offset,
+                         timeout=0, http_timeout=10)
+            except Exception:
+                pass
+        print("bye")
 
 
 def main():
