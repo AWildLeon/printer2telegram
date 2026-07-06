@@ -110,11 +110,15 @@ class Bot:
         self.api = f"https://api.telegram.org/bot{token}"
         self.file_api = f"https://api.telegram.org/file/bot{token}"
         self.offset = None
+        # keep-alive: a fresh TLS handshake per call costs ~100ms,
+        # a pooled connection ~30ms (urllib3's pool is thread-safe,
+        # so sharing between poller and worker is fine)
+        self.http = requests.Session()
 
     def call(self, method, files=None, http_timeout=35, **params):
         for attempt in range(2):
-            r = requests.post(f"{self.api}/{method}", data=params,
-                              files=files, timeout=http_timeout)
+            r = self.http.post(f"{self.api}/{method}", data=params,
+                               files=files, timeout=http_timeout)
             try:
                 data = r.json()
             except ValueError:
@@ -159,8 +163,8 @@ class Bot:
 
     def download(self, file_id):
         info = self.call("getFile", file_id=file_id)
-        r = requests.get(f"{self.file_api}/{info['file_path']}",
-                         timeout=120)
+        r = self.http.get(f"{self.file_api}/{info['file_path']}",
+                          timeout=120)
         r.raise_for_status()
         return r.content
 
@@ -658,6 +662,10 @@ def enqueue(bot, jobs, chat, reply_to, note, job):
                       reply_to=reply_to)
     elif note:
         bot.send_text(chat, note, reply_to=reply_to)
+    else:
+        # instant sign of life while the job runs (print jobs
+        # only confirm once CUPS has the file)
+        bot.call("sendChatAction", chat_id=chat, action="typing")
     jobs.put((chat, reply_to, job))
 
 
@@ -731,9 +739,15 @@ def run(config):
                                                 state)
                         except Exception:
                             traceback.print_exc()
-            except (OSError, requests.RequestException) as e:
-                print(f"connection lost: {e}, reconnecting in 30s")
-                time.sleep(30)
+            except (OSError, requests.RequestException,
+                    RuntimeError) as e:
+                # RuntimeError covers telegram-side errors like the
+                # 409 Conflict a second polling instance provokes;
+                # only a bad token is hopeless
+                if "unauthorized" in str(e).lower():
+                    sys.exit(f"telegram rejects the token: {e}")
+                print(f"connection lost: {e}, reconnecting in 10s")
+                time.sleep(10)
     except Shutdown as e:
         # a second signal now kills us the hard way
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
