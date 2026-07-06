@@ -79,6 +79,10 @@ class State:
             self.data = {}
         self.data.setdefault("users", [])
         self.data.setdefault("settings", {})
+        # runtime only: the current settings menu per chat, so a
+        # new /einstellungen replaces the old menu instead of
+        # leaving stale keyboards around
+        self.menus = {}
 
     def save(self):
         tmp = f"{self.path}.tmp"
@@ -135,13 +139,23 @@ class Bot:
             self.offset = updates[-1]["update_id"] + 1
         return updates
 
-    def send_text(self, chat_id, text):
-        self.call("sendMessage", chat_id=chat_id, text=text)
+    @staticmethod
+    def _reply_params(reply_to):
+        if reply_to is None:
+            return {}
+        return {"reply_to_message_id": reply_to,
+                "allow_sending_without_reply": "true"}
 
-    def send_document(self, chat_id, filename, payload, caption):
+    def send_text(self, chat_id, text, reply_to=None):
+        self.call("sendMessage", chat_id=chat_id, text=text,
+                  **self._reply_params(reply_to))
+
+    def send_document(self, chat_id, filename, payload, caption,
+                      reply_to=None):
         self.call("sendDocument", chat_id=chat_id, caption=caption,
                   http_timeout=120,
-                  files={"document": (filename, payload)})
+                  files={"document": (filename, payload)},
+                  **self._reply_params(reply_to))
 
     def download(self, file_id):
         info = self.call("getFile", file_id=file_id)
@@ -245,9 +259,27 @@ PRINTABLE_TYPES = {
 }
 
 
+def describe_print_options(options):
+    """Human-readable german summary, e.g. "2×, beidseitig, A4"."""
+    sides = {"two-sided-long-edge": "beidseitig",
+             "one-sided": "einseitig"}
+    color = {"monochrome": "schwarzweiß", "color": "Farbe"}
+    parts = []
+    if "copies" in options:
+        parts.append(f"{options['copies']}×")
+    if options.get("sides") in sides:
+        parts.append(sides[options["sides"]])
+    if options.get("print-color-mode") in color:
+        parts.append(color[options["print-color-mode"]])
+    if "media" in options:
+        parts.append(options["media"])
+    return ", ".join(parts)
+
+
 def handle_print_request(bot, msg, config, state):
     """Print the message's document or photo via CUPS."""
     chat = msg["chat"]["id"]
+    mid = msg.get("message_id")
     if "photo" in msg:
         # sizes come smallest first, take the largest
         payload = bot.download(msg["photo"][-1]["file_id"])
@@ -259,7 +291,7 @@ def handle_print_request(bot, msg, config, state):
         if mime not in PRINTABLE_TYPES:
             bot.send_text(chat, f"Kann {name} ({mime}) nicht drucken "
                                 f"– bitte PDF, JPEG oder PNG "
-                                f"schicken.")
+                                f"schicken.", reply_to=mid)
             return
         payload = bot.download(doc["file_id"])
     options = parse_print_options(msg, state.settings(chat))
@@ -275,7 +307,10 @@ def handle_print_request(bot, msg, config, state):
     finally:
         os.unlink(path)
     print(f"printed {name} for {msg['from']['id']}")
-    bot.send_text(chat, f"Wird gedruckt: {name}")
+    how = describe_print_options(options)
+    bot.send_text(chat, f"Wird gedruckt: {name}"
+                        + (f" ({how})" if how else ""),
+                  reply_to=mid)
 
 
 def parse_scan_options(msg, settings):
@@ -362,6 +397,9 @@ def handle_scan_request(bot, msg, config, state):
     chat = msg["chat"]["id"]
     options = parse_scan_options(msg, state.settings(chat))
     dpi = options["resolution"]
+    # "sending a file..." indicator while the scanner works
+    bot.call("sendChatAction", chat_id=chat,
+             action="upload_document")
     sane.init()
     try:
         device = config.scanner
@@ -385,7 +423,8 @@ def handle_scan_request(bot, msg, config, state):
     pages[0].save(buf, "PDF", resolution=dpi, save_all=True,
                   append_images=pages[1:])
     bot.send_document(chat, "scan.pdf", buf.getvalue(),
-                      f"{len(pages)} Seite(n)")
+                      f"{len(pages)} Seite(n), {dpi} dpi",
+                      reply_to=msg.get("message_id"))
     print(f"scan ({len(pages)} pages) sent to {chat}")
 
 
@@ -421,12 +460,22 @@ def settings_keyboard(s):
 
 
 def handle_settings_request(bot, msg, state):
-    """Answer /einstellungen with the interactive menu."""
+    """Answer /einstellungen with the interactive menu.
+
+    Only one menu per chat stays alive: the previous one is
+    deleted so no stale keyboards linger."""
     chat = msg["chat"]["id"]
+    old = state.menus.get(chat)
+    if old is not None:
+        try:
+            bot.call("deleteMessage", chat_id=chat, message_id=old)
+        except RuntimeError:
+            pass  # already gone or too old to delete
     kb = settings_keyboard(state.settings(chat))
-    bot.call("sendMessage", chat_id=chat,
-             text="Einstellungen – zum Ändern antippen:",
-             reply_markup=json.dumps(kb))
+    sent = bot.call("sendMessage", chat_id=chat,
+                    text="Einstellungen – zum Ändern antippen:",
+                    reply_markup=json.dumps(kb))
+    state.menus[chat] = sent["message_id"]
 
 
 def handle_setting(bot, cb, state):
@@ -441,9 +490,14 @@ def handle_setting(bot, cb, state):
     i = values.index(s[key]) if s[key] in values else -1
     s[key] = values[(i + 1) % len(values)]
     state.save()
-    bot.call("editMessageReplyMarkup", chat_id=chat,
-             message_id=msg["message_id"],
-             reply_markup=json.dumps(settings_keyboard(s)))
+    try:
+        bot.call("editMessageReplyMarkup", chat_id=chat,
+                 message_id=msg["message_id"],
+                 reply_markup=json.dumps(settings_keyboard(s)))
+    except RuntimeError as e:
+        # the keyboard already showing the right values is fine
+        if "not modified" not in str(e):
+            raise
 
 
 def request_approval(bot, msg, config, pending):
@@ -496,13 +550,16 @@ def handle_approval(bot, cb, config, state):
 
 
 def ack(bot, cb, text=None):
-    """Stop a button's loading spinner; failure is harmless (it
-    means the button was pressed while we were offline)."""
+    """Stop a button's loading spinner. Returns False if the
+    query already expired, i.e. the button was pressed while we
+    were offline."""
     try:
         bot.call("answerCallbackQuery",
                  callback_query_id=cb["id"], text=text)
+        return True
     except RuntimeError as e:
         print(f"cannot answer callback: {e}")
+        return False
 
 
 def handle_callback(bot, cb, config, state):
@@ -510,8 +567,12 @@ def handle_callback(bot, cb, config, state):
     data = cb.get("data") or ""
     if data.startswith("set:"):
         # ack before doing anything: rapid taps must not sit in
-        # a spinner while we redraw the keyboard for earlier ones
-        ack(bot, cb)
+        # a spinner while we redraw the keyboard for earlier
+        # ones. An expired tap (pressed while we were offline)
+        # is dropped: applying it now would change settings
+        # behind the user's back.
+        if not ack(bot, cb):
+            return
         try:
             if is_allowed(cb["from"]["id"], config, state):
                 handle_setting(bot, cb, state)
@@ -548,7 +609,7 @@ def is_busy_error(e):
     return "busy" in str(e).lower()
 
 
-def run_job(bot, chat, job, stop):
+def run_job(bot, chat, reply_to, job, stop):
     """Run one queued job, waiting out a busy device with backoff."""
     for i in range(len(RETRY_DELAYS) + 1):
         try:
@@ -557,27 +618,31 @@ def run_job(bot, chat, job, stop):
         except Exception as e:
             if i == len(RETRY_DELAYS) or not is_busy_error(e):
                 traceback.print_exc()
-                bot.send_text(chat, f"Fehlgeschlagen: {e}")
+                bot.send_text(chat, f"Fehlgeschlagen: {e}",
+                              reply_to=reply_to)
                 return
             if i == 0:
                 bot.send_text(chat, "Das Gerät ist gerade "
                                     "beschäftigt – ich versuche es "
-                                    "automatisch weiter.")
+                                    "automatisch weiter.",
+                              reply_to=reply_to)
             print(f"device busy, retrying in {RETRY_DELAYS[i]}s")
             if stop.wait(RETRY_DELAYS[i]):
-                bot.send_text(chat, SHUTDOWN_TEXT)
+                bot.send_text(chat, SHUTDOWN_TEXT,
+                              reply_to=reply_to)
                 return
 
 
 def worker(bot, jobs, stop):
     """Process print/scan jobs one after the other, forever."""
     while True:
-        chat, job = jobs.get()
+        chat, reply_to, job = jobs.get()
         try:
             if stop.is_set():
-                bot.send_text(chat, SHUTDOWN_TEXT)
+                bot.send_text(chat, SHUTDOWN_TEXT,
+                              reply_to=reply_to)
             else:
-                run_job(bot, chat, job, stop)
+                run_job(bot, chat, reply_to, job, stop)
         except Exception:
             # e.g. telegram unreachable while reporting a failure
             traceback.print_exc()
@@ -585,14 +650,15 @@ def worker(bot, jobs, stop):
             jobs.task_done()
 
 
-def enqueue(bot, jobs, chat, note, job):
+def enqueue(bot, jobs, chat, reply_to, note, job):
     """Queue a job; tell the user if it has to wait its turn."""
     if jobs.unfinished_tasks:
         bot.send_text(chat, "Ein anderer Auftrag läuft noch – "
-                            "deiner ist eingereiht.")
+                            "deiner ist eingereiht.",
+                      reply_to=reply_to)
     elif note:
-        bot.send_text(chat, note)
-    jobs.put((chat, job))
+        bot.send_text(chat, note, reply_to=reply_to)
+    jobs.put((chat, reply_to, job))
 
 
 def handle_message(bot, jobs, msg, config, state, pending):
@@ -606,12 +672,13 @@ def handle_message(bot, jobs, msg, config, state, pending):
             return
         kind = classify_request(msg)
         print(f"request from {user}: {kind}")
+        mid = msg.get("message_id")
         if kind == "print":
-            enqueue(bot, jobs, chat, None,
+            enqueue(bot, jobs, chat, mid, None,
                     lambda: handle_print_request(bot, msg, config,
                                                  state))
         elif kind == "scan":
-            enqueue(bot, jobs, chat, "Scanne …",
+            enqueue(bot, jobs, chat, mid, "Scanne …",
                     lambda: handle_scan_request(bot, msg, config,
                                                 state))
         elif kind == "settings":
@@ -623,7 +690,8 @@ def handle_message(bot, jobs, msg, config, state, pending):
     except Exception as e:
         print(f"failed to handle message from {user}:")
         traceback.print_exc()
-        bot.send_text(chat, f"Fehlgeschlagen: {e}")
+        bot.send_text(chat, f"Fehlgeschlagen: {e}",
+                      reply_to=msg.get("message_id"))
 
 
 def run(config):
