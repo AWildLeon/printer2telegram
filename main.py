@@ -107,17 +107,24 @@ class Bot:
         self.offset = None
 
     def call(self, method, files=None, http_timeout=35, **params):
-        r = requests.post(f"{self.api}/{method}", data=params,
-                          files=files, timeout=http_timeout)
-        try:
-            data = r.json()
-        except ValueError:
-            # e.g. an HTML error page from a proxy
-            r.raise_for_status()
-            raise RuntimeError(f"{method}: non-JSON response")
-        if not data.get("ok"):
+        for attempt in range(2):
+            r = requests.post(f"{self.api}/{method}", data=params,
+                              files=files, timeout=http_timeout)
+            try:
+                data = r.json()
+            except ValueError:
+                # e.g. an HTML error page from a proxy
+                r.raise_for_status()
+                raise RuntimeError(f"{method}: non-JSON response")
+            if data.get("ok"):
+                return data["result"]
+            # rate limited: telegram tells us how long to back off
+            retry = data.get("parameters", {}).get("retry_after")
+            if attempt == 0 and retry is not None and retry <= 30:
+                print(f"{method}: rate limited, waiting {retry}s")
+                time.sleep(retry)
+                continue
             raise RuntimeError(f"{method}: {data.get('description')}")
-        return data["result"]
 
     def poll(self):
         """One long-poll round, returns a (possibly empty) batch."""
@@ -487,27 +494,38 @@ def handle_approval(bot, cb, config, state):
     return verdict
 
 
+def ack(bot, cb, text=None):
+    """Stop a button's loading spinner; failure is harmless (it
+    means the button was pressed while we were offline)."""
+    try:
+        bot.call("answerCallbackQuery",
+                 callback_query_id=cb["id"], text=text)
+    except RuntimeError as e:
+        print(f"cannot answer callback: {e}")
+
+
 def handle_callback(bot, cb, config, state):
     """Route a button press (settings menu or admin approval)."""
     data = cb.get("data") or ""
-    answer = None
-    try:
-        if data.startswith(("allow:", "deny:")):
-            answer = handle_approval(bot, cb, config, state)
-        elif (data.startswith("set:")
-              and is_allowed(cb["from"]["id"], config, state)):
-            handle_setting(bot, cb, state)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        # always stop the button's loading spinner; this fails
-        # ("query is too old") for buttons that were pressed
-        # while we were offline, which is fine
+    if data.startswith("set:"):
+        # ack before doing anything: rapid taps must not sit in
+        # a spinner while we redraw the keyboard for earlier ones
+        ack(bot, cb)
         try:
-            bot.call("answerCallbackQuery",
-                     callback_query_id=cb["id"], text=answer)
-        except RuntimeError as e:
-            print(f"cannot answer callback: {e}")
+            if is_allowed(cb["from"]["id"], config, state):
+                handle_setting(bot, cb, state)
+        except Exception:
+            traceback.print_exc()
+    elif data.startswith(("allow:", "deny:")):
+        answer = None
+        try:
+            answer = handle_approval(bot, cb, config, state)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            ack(bot, cb, answer)
+    else:
+        ack(bot, cb)
 
 
 # wait this long between attempts while the device is busy
