@@ -1,6 +1,9 @@
 # real credentials live here -- never commit
 config.yaml
 
+# runtime state (approved users, per-chat settings)
+state.yaml
+
 # nix build output
 result
 result-*
