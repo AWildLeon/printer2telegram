@@ -1,0 +1,46 @@
+# Copy to compose.yaml and adjust. Needs ./config.yaml next to it
+# (see config.example.yaml) -- it holds the bot token, so keep it
+# out of git.
+
+services:
+  printer2telegram:
+    image: ghcr.io/awildleon/printer2telegram:latest
+    restart: unless-stopped
+
+    volumes:
+      # the config is read once at startup; read-only is enough
+      - ./config.yaml:/config/config.yaml:ro
+      # approved users and per-chat settings (state.yaml)
+      - printer2telegram-data:/data
+
+    environment:
+      # CUPS runs on the host, not in this container. Point libcups at
+      # it -- the host must accept connections from the docker bridge
+      # ("Listen 631" + "Allow @LOCAL" in cupsd.conf). Alternatively
+      # bind-mount the socket (see below) and drop this line.
+      CUPS_SERVER: "host.docker.internal"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Alternative to CUPS_SERVER: talk to the host's cupsd over its
+    # unix socket. Needs no cupsd.conf change, but the socket must be
+    # readable by uid 1000 (the container's "app" user).
+    #   volumes:
+    #     - /run/cups/cups.sock:/run/cups/cups.sock
+    #   environment:
+    #     CUPS_SERVER: "/run/cups/cups.sock"
+
+    # A network scanner (escl:/airscan:) is reached over the network;
+    # nothing else to do. For a USB scanner, hand the device through:
+    #   devices:
+    #     - /dev/bus/usb:/dev/bus/usb
+    #   user: root
+
+    # eSCL/AirScan autodiscovery uses mDNS, which does not cross the
+    # docker bridge. Either set an explicit scanner URL in config.yaml
+    # (recommended) or run on the host network:
+    #   network_mode: host
+
+volumes:
+  printer2telegram-data:

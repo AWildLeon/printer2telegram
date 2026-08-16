@@ -9,3 +9,6 @@ result
 result-*
 
 __pycache__/
+
+# local docker compose override of compose.example.yaml
+compose.yaml

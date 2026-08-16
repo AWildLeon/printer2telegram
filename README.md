@@ -50,6 +50,36 @@ $ nix run .            # uses ./config.yaml
 $ nix run . -- /path/to/config.yaml
 ```
 
+## Docker
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are built by GitHub
+Actions and pushed to
+`ghcr.io/awildleon/printer2telegram:latest`.
+
+```console
+$ cp compose.example.yaml compose.yaml   # then edit it
+$ cp config.example.yaml config.yaml     # token, printer, user ids
+$ docker compose up -d
+```
+
+The container ships the CUPS and SANE client libraries but no
+daemons, so two things come from outside:
+
+- **Printing**: CUPS runs on the host. Set `CUPS_SERVER` to the
+  host's address (the example compose file uses
+  `host.docker.internal`; the host's `cupsd.conf` then needs
+  `Listen 631` and `Allow @LOCAL`), or bind-mount
+  `/run/cups/cups.sock` into the container.
+- **Scanning**: a network scanner is reached over the network --
+  set an explicit `scanner:` URL in `config.yaml`, because mDNS
+  autodiscovery does not cross the docker bridge. A USB scanner
+  needs `/dev/bus/usb` passed through.
+
+`config.yaml` is mounted read-only at `/config/config.yaml`;
+`state.yaml` (approved users, per-chat settings) is written to the
+`/data` volume. The process runs as uid 1000, so a bind-mounted
+`/data` must be writable by that uid.
+
 ## NixOS module
 
 ```nix

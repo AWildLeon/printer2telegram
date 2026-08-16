@@ -1,0 +1,8 @@
+# Runtime dependencies, mirroring pythonDeps in flake.nix.
+# pycups and python-sane are C extensions and are compiled in the
+# Dockerfile's build stage (libcups2-dev / libsane-dev).
+pillow
+pycups
+python-sane
+pyyaml
+requests
